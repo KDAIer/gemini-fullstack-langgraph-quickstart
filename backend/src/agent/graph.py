@@ -1,5 +1,4 @@
 import os
-
 from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
@@ -7,7 +6,6 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-# from google.genai import Client
 
 from agent.state import (
     OverallState,
@@ -23,38 +21,29 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-# from langchain_google_genai import ChatGoogleGenerativeAI
 from agent.llm_client import LLMClient
-from agent.utils import (
+
+# 在已有段落的指定位置插入文献/网页引用链接（utils.py 中的函数）
+from agent.utils import ( 
     get_citations,
     get_research_topic,
     insert_citation_markers,
     resolve_urls,
 )
 
-# load_dotenv()
+# LLMClient 是一个封装了 LLM 调用的客户端，支持多种模型和配置
+llm = LLMClient() 
 
-# if os.getenv("GEMINI_API_KEY") is None:
-#     raise ValueError("GEMINI_API_KEY is not set")
-
-# # Used for Google Search API
-# genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-llm = LLMClient()
-
-# Nodes
+# 生成初始查询：根据输入，它使用 deepseek-v3 模型生成一组初始搜索查询
+# 自动编写若干检索关键词，供后续做真正或模拟搜索使用
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """LangGraph node that generates search queries based on the User's question.
-
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
-    the User's question.
+    """LangGraph 节点根据用户的问题生成搜索查询
 
     Args:
-        state: Current graph state containing the User's question
-        config: Configuration for the runnable, including LLM provider settings
-
+        state: 当前图状态，包含用户消息和初始搜索查询计数
+        config: 可运行配置，包含查询生成模型和初始查询数量
     Returns:
-        Dictionary with state update, including search_query key containing the generated queries
+        包含状态更新的字典，其中包含已生成查询的 search_query 键
     """
     configurable = Configuration.from_runnable_config(config)
 
@@ -62,83 +51,63 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    # llm = ChatGoogleGenerativeAI(
-    #     model=configurable.query_generator_model,
-    #     temperature=1.0,
-    #     max_retries=2,
-    #     api_key=os.getenv("GEMINI_API_KEY"),
-    # )
-    # structured_llm = llm.with_structured_output(SearchQueryList)
-
-    # # Format the prompt
-    # current_date = get_current_date()
-    # formatted_prompt = query_writer_instructions.format(
-    #     current_date=current_date,
-    #     research_topic=get_research_topic(state["messages"]),
-    #     number_queries=state["initial_search_query_count"],
-    # )
-    # # Generate the search queries
-    # result = structured_llm.invoke(formatted_prompt)
-    # return {"search_query": result.query}
-
     # Format the prompt
     formatted_prompt = query_writer_instructions.format(
         current_date=get_current_date(),
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Use the LLMClient to generate the search queries
+
+    # 调用 LLMClient 的 query 方法，传入格式化的提示和模型
     raw = llm.query(
         formatted_prompt,
-        model_name="qwen-turbo",
+        model_name="deepseek-v3",
         temperature=1.0,
         deployment="ali",
-        system_message="你是一个结构化响应助手，请严格以 JSON 格式返回结果，不要多余内容。"
+        system_message="你是一个结构化响应助手，只返回纯 JSON，不要任何 code fence、注释或多余文字。"
     )
+    print("generate_query raw repr:", repr(raw))
 
-    print("generate_query raw output:", raw)
+    from agent.utils import strip_code_fence
     import json
-    parsed = json.loads(raw)
-    # —— 兼容多种可能的返回格式 —— 
+
+    raw_clean = strip_code_fence(raw)
+    print("generate_query cleaned JSON:", raw_clean)
+    if not raw_clean:
+        # 如果 LLM 真没回，至少用用户输入当做单条 query
+        fallback = get_research_topic(state["messages"])
+        print(f"LLM 无返回，fallback to: {fallback}")
+        return {"search_query": [fallback]}
+
+    try:
+        parsed = json.loads(raw_clean)
+    except json.JSONDecodeError as e:
+        # JSON 解析失败时，也 fallback
+        print(f"JSONDecodeError: {e}; raw_clean repr: {repr(raw_clean)}")
+        return {"search_query": [raw_clean]}
+
+    # —— 兼容多种格式 —— 
     if isinstance(parsed, list):
-        # 如果直接就是字符串列表
         queries = parsed
     elif "queries" in parsed:
         queries = parsed["queries"]
     elif "query" in parsed:
-        # 可能单条时叫 query
         queries = [parsed["query"]]
     else:
-        # 回退：把整个文本按行拆分
-        queries = [line.strip() for line in raw.splitlines() if line.strip()]
+        queries = [line.strip() for line in raw_clean.splitlines() if line.strip()]
 
     return {"search_query": queries}
 
-
+# 把上一步生成的多个 search_query 拆成 N 条并行任务，分别发给 web_research 节点
 def continue_to_web_research(state: QueryGenerationState):
-    """LangGraph node that sends the search queries to the web research node.
-
-    This is used to spawn n number of web research nodes, one for each search query.
-    """
     return [
         Send("web_research", {"search_query": search_query, "id": int(idx)})
         for idx, search_query in enumerate(state["search_query"])
     ]
 
 
+# 网络研究：对于每个查询，它使用 deepseek-v3 模型和网页搜索工具（//mysql数据库）来查找相关的网页
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
-
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
-
-    Args:
-        state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
-
-    Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
-    """
     # Configure
     configurable = Configuration.from_runnable_config(config)
     formatted_prompt = web_searcher_instructions.format(
@@ -166,7 +135,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     # 使用 LLMClient 获取“假想”的搜索摘要
     raw = llm.query(
         formatted_prompt,
-        model_name="qwen-turbo",
+        model_name="deepseek-v3",
         temperature=0,
         deployment="ali",
     )
@@ -175,16 +144,17 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     # 这里我们不再维护 grounding 元数据
     sources_gathered = []
  
-
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
         "web_research_result": [modified_text],
     }
 
-
+# 反思与知识差距分析：代理会分析搜索结果，以确定信息是否充足或是否存在知识差距
+# 使用 deepseek-v3 模型来判断是否需要进一步研究
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     configurable = Configuration.from_runnable_config(config)
+    # 统计轮数
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
     reasoning_model = state.get("reasoning_model", configurable.reflection_model)
 
@@ -197,19 +167,14 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     # 调用 LLMClient
     raw = llm.query(
         formatted_prompt,
-        model_name="qwen-turbo",
+        model_name="deepseek-v3",
         temperature=1.0,
         deployment="ali",
         system_message="请严格以 JSON 格式返回 is_sufficient, knowledge_gap 和 follow_up_queries 字段"
     )
 
-    # 去除 Markdown code fence，如果存在的话
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # 找到最后一个 ``` 并去掉 fences
-        parts = cleaned.split("```", 2)
-        if len(parts) == 3:
-            cleaned = parts[2].strip()
+    from agent.utils import strip_code_fence
+    cleaned = strip_code_fence(raw)
 
     # 打印清洗后的内容，便于调试
     print("reflection cleaned JSON:", cleaned)
@@ -226,31 +191,23 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     knowledge_gap     = parsed.get("knowledge_gap", "")
     follow_up_queries = parsed.get("follow_up_queries", [])
     return {
-        "is_sufficient": is_sufficient,
-        "knowledge_gap": knowledge_gap,
-        "follow_up_queries": follow_up_queries,
-        "research_loop_count": state["research_loop_count"],
-        "number_of_ran_queries": len(state["search_query"]),
+        "is_sufficient": is_sufficient, # 判断目前收集到的摘要是否已足够回答用户
+        "knowledge_gap": knowledge_gap, # 当前知识是否存在差距
+        "follow_up_queries": follow_up_queries, # 后续查询列表
+        "research_loop_count": state["research_loop_count"], # 当前研究轮数
+        "number_of_ran_queries": len(state["search_query"]), # 已执行查询数量
     }
 
+# 迭代细化：如果发现差距或信息不足，它会生成后续查询并重复网络研究和反思步骤（最多配置的最大循环次数）
 def evaluate_research(
     state: ReflectionState,
     config: RunnableConfig,
 ) -> OverallState:
-    """LangGraph routing function that determines the next step in the research flow.
 
-    Controls the research loop by deciding whether to continue gathering information
-    or to finalize the summary based on the configured maximum number of research loops.
-
-    Args:
-        state: Current graph state containing the research loop count
-        config: Configuration for the runnable, including max_research_loops setting
-
-    Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
-    """
     configurable = Configuration.from_runnable_config(config)
-    max_research_loops = (
+
+    # 达到最大研究轮数或已满足条件时，直接返回 finalize_answer
+    max_research_loops = ( 
         state.get("max_research_loops")
         if state.get("max_research_loops") is not None
         else configurable.max_research_loops
@@ -269,20 +226,9 @@ def evaluate_research(
             for idx, follow_up_query in enumerate(state["follow_up_queries"])
         ]
 
-
+# Finalize the answer: 该节点将收集到的研究结果和引用整合成最终的研究报告，并添加适当的引用标记
 def finalize_answer(state: OverallState, config: RunnableConfig):
-    """LangGraph node that finalizes the research summary.
 
-    Prepares the final output by deduplicating and formatting sources, then
-    combining them with the running summary to create a well-structured
-    research report with proper citations.
-
-    Args:
-        state: Current graph state containing the running summary and sources gathered
-
-    Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
-    """
     configurable = Configuration.from_runnable_config(config)
     reasoning_model = state.get("reasoning_model") or configurable.answer_model
 
@@ -294,25 +240,18 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    # llm = ChatGoogleGenerativeAI(
-    #     model=reasoning_model,
-    #     temperature=0,
-    #     max_retries=2,
-    #     api_key=os.getenv("GEMINI_API_KEY"),
-    # )
-    # result = llm.invoke(formatted_prompt)
     raw = llm.query(
         formatted_prompt,
-        model_name="qwen-turbo",
+        model_name="deepseek-v3",
         temperature=0,
         deployment="ali",
     )
+
+    # 这里模拟替换短链为原始 URL
     class Dummy: pass
     result = Dummy()
     result.content = raw
 
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
     for source in state["sources_gathered"]:
         if source["short_url"] in result.content:
@@ -337,7 +276,6 @@ builder.add_node("reflection", reflection)
 builder.add_node("finalize_answer", finalize_answer)
 
 # Set the entrypoint as `generate_query`
-# This means that this node is the first one called
 builder.add_edge(START, "generate_query")
 # Add conditional edge to continue with search queries in a parallel branch
 builder.add_conditional_edges(

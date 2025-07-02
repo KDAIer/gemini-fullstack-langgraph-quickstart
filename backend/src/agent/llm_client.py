@@ -7,7 +7,7 @@ import openai
 import time
 import asyncio
 import os
-
+import numpy as np
 from typing import Optional, Dict, Any, List, Tuple, Union
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,7 +16,8 @@ import logging
 import openai
 import time
 import asyncio
-import numpy as np
+from langchain.callbacks.tracers import LangChainTracer
+from langchain_core.callbacks import CallbackManager
 
 
 class LLMClient:
@@ -53,6 +54,8 @@ class LLMClient:
             openai.RateLimitError,
             openai.InternalServerError
         )
+        self.tracer = LangChainTracer()
+        self.callback_manager = CallbackManager([self.tracer])
 
     @lru_cache(maxsize=10)
     def _get_model(self, model_name: str, api_key: str, api_base: str, temperature: float) -> ChatOpenAI:
@@ -64,6 +67,8 @@ class LLMClient:
             temperature=temperature,
             timeout=60,  # 设置超时时间
             max_retries=2,  # 设置重试次数
+            callback_manager=self.callback_manager,
+            verbose=True,  
         )
 
     @lru_cache(maxsize=5)
@@ -472,7 +477,7 @@ class LLMClient:
         configs = {
             "ali": {
                 # 从环境变量读取 DashScope Key
-                "api_key": os.getenv("DASHSCOPE_API_KEY", ""),
+                "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
                 "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "default_model": "deepseek-v3",
             },

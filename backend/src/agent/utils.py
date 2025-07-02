@@ -1,17 +1,29 @@
 from typing import Any, Dict, List
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
+import re
 
+def strip_code_fence(text: str) -> str:
+    """
+    去掉多余的 ``` 或 ```json fences，只留下内部内容。
+    如果没 fence，则返回原字符串 strip() 后的结果。
+    """
+    text = text.strip()
+    pattern = r"^```(?:json)?\s*([\s\S]+?)\s*```$"
+    m = re.match(pattern, text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return text
 
+# 从 LangGraph 的消息流中提炼“研究主题”文本
 def get_research_topic(messages: List[AnyMessage]) -> str:
-    """
-    Get the research topic from the messages.
-    """
-    # check if request has a history and combine the messages into a single string
-    if len(messages) == 1:
+    if len(messages) == 1: # 如果只有一条消息，直接取它的 content 作为主题
         research_topic = messages[-1].content
     else:
         research_topic = ""
-        for message in messages:
+        # 遍历所有消息，提取人类和 AI 的内容
+        # 人类消息前缀为 "User: "，AI 消息前缀为 "Assistant: "
+        # 这样可以确保研究主题包含所有相关对话内容
+        for message in messages: 
             if isinstance(message, HumanMessage):
                 research_topic += f"User: {message.content}\n"
             elif isinstance(message, AIMessage):
@@ -19,50 +31,41 @@ def get_research_topic(messages: List[AnyMessage]) -> str:
     return research_topic
 
 
+# 把原本很长的网页或文档 URI 映射成统一短链，方便在报告中引用
 def resolve_urls(urls_to_resolve: List[Any], id: int) -> Dict[str, str]:
-    """
-    Create a map of the vertex ai search urls (very long) to a short url with a unique id for each url.
-    Ensures each original URL gets a consistent shortened form while maintaining uniqueness.
-    """
-    prefix = f"https://vertexaisearch.cloud.google.com/id/"
+    prefix = f"https://extractresearch.frame.com/id/"
     urls = [site.web.uri for site in urls_to_resolve]
 
-    # Create a dictionary that maps each unique URL to its first occurrence index
     resolved_map = {}
+    # 按出现顺序给每个唯一 URL 分配短链
     for idx, url in enumerate(urls):
         if url not in resolved_map:
             resolved_map[url] = f"{prefix}{id}-{idx}"
 
     return resolved_map
 
-
+# 在已有段落的指定位置插入文献/网页引用链接
 def insert_citation_markers(text, citations_list):
     """
-    Inserts citation markers into a text string based on start and end indices.
 
     Args:
-        text (str): The original text string.
-        citations_list (list): A list of dictionaries, where each dictionary
-                               contains 'start_index', 'end_index', and
-                               'segment_string' (the marker to insert).
-                               Indices are assumed to be for the original text.
+        text: 原文字符串。
+        citations_list: 每条引用信息包含: 
+            start_index、end_index: 标记在原文中的字符区间。
+            segments: 列表，每个元素有 label(链接文本)、short_url(跳转短链)。
 
     Returns:
         str: The text with citation markers inserted.
     """
-    # Sort citations by end_index in descending order.
-    # If end_index is the same, secondary sort by start_index descending.
-    # This ensures that insertions at the end of the string don't affect
-    # the indices of earlier parts of the string that still need to be processed.
+
+    # 按 end_index 从大到小排序，避免插入后影响前面索引
     sorted_citations = sorted(
         citations_list, key=lambda c: (c["end_index"], c["start_index"]), reverse=True
     )
 
+    # 对每个引用，生成诸如 [来源标签](短链) 的 Markdown 链接串，插入到 end_index 位置
     modified_text = text
     for citation_info in sorted_citations:
-        # These indices refer to positions in the *original* text,
-        # but since we iterate from the end, they remain valid for insertion
-        # relative to the parts of the string already processed.
         end_idx = citation_info["end_index"]
         marker_to_insert = ""
         for segment in citation_info["segments"]:
@@ -75,42 +78,17 @@ def insert_citation_markers(text, citations_list):
     return modified_text
 
 
+# 从 LLM 响应的 grounding_metadata 中提取引用所需信息
+# grounding_metadata 是模型提供的支持性证据，包含原文片段和引用的网页信息
 def get_citations(response, resolved_urls_map):
-    """
-    Extracts and formats citation information from a Gemini model's response.
 
-    This function processes the grounding metadata provided in the response to
-    construct a list of citation objects. Each citation object includes the
-    start and end indices of the text segment it refers to, and a string
-    containing formatted markdown links to the supporting web chunks.
-
-    Args:
-        response: The response object from the Gemini model, expected to have
-                  a structure including `candidates[0].grounding_metadata`.
-                  It also relies on a `resolved_map` being available in its
-                  scope to map chunk URIs to resolved URLs.
-
-    Returns:
-        list: A list of dictionaries, where each dictionary represents a citation
-              and has the following keys:
-              - "start_index" (int): The starting character index of the cited
-                                     segment in the original text. Defaults to 0
-                                     if not specified.
-              - "end_index" (int): The character index immediately after the
-                                   end of the cited segment (exclusive).
-              - "segments" (list[str]): A list of individual markdown-formatted
-                                        links for each grounding chunk.
-              - "segment_string" (str): A concatenated string of all markdown-
-                                        formatted links for the citation.
-              Returns an empty list if no valid candidates or grounding supports
-              are found, or if essential data is missing.
-    """
     citations = []
 
-    # Ensure response and necessary nested structures are present
+    # 没有引用
     if not response or not response.candidates:
         return citations
 
+    # 只处理第一个候选项
     candidate = response.candidates[0]
     if (
         not hasattr(candidate, "grounding_metadata")
@@ -119,12 +97,14 @@ def get_citations(response, resolved_urls_map):
     ):
         return citations
 
+    # 这是模型给出的“支持性证据”列表。每个 support 包含两个关键信息块：
+    # 1. segment: 该支持信息在原文中的起止位置
+    # 2. grounding_chunk_indices: 引用的具体段落或网页片段
     for support in candidate.grounding_metadata.grounding_supports:
         citation = {}
 
-        # Ensure segment information is present
         if not hasattr(support, "segment") or support.segment is None:
-            continue  # Skip this support if segment info is missing
+            continue  
 
         start_index = (
             support.segment.start_index
@@ -132,12 +112,12 @@ def get_citations(response, resolved_urls_map):
             else 0
         )
 
-        # Ensure end_index is present to form a valid segment
+        # 如果没有 end_index，跳过这个支持项
+        # end_index 是必须的，因为它定义了引用的结束位置
         if support.segment.end_index is None:
-            continue  # Skip if end_index is missing, as it's crucial
+            continue 
 
-        # Add 1 to end_index to make it an exclusive end for slicing/range purposes
-        # (assuming the API provides an inclusive end_index)
+        # 构建 citation 对象
         citation["start_index"] = start_index
         citation["end_index"] = support.segment.end_index
 
@@ -158,9 +138,6 @@ def get_citations(response, resolved_urls_map):
                         }
                     )
                 except (IndexError, AttributeError, NameError):
-                    # Handle cases where chunk, web, uri, or resolved_map might be problematic
-                    # For simplicity, we'll just skip adding this particular segment link
-                    # In a production system, you might want to log this.
                     pass
         citations.append(citation)
     return citations
