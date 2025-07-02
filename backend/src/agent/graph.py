@@ -7,7 +7,7 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+# from google.genai import Client
 
 from agent.state import (
     OverallState,
@@ -23,7 +23,8 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_google_genai import ChatGoogleGenerativeAI
+from agent.llm_client import LLMClient
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -31,14 +32,15 @@ from agent.utils import (
     resolve_urls,
 )
 
-load_dotenv()
+# load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+# if os.getenv("GEMINI_API_KEY") is None:
+#     raise ValueError("GEMINI_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+# # Used for Google Search API
+# genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+llm = LLMClient()
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -61,24 +63,57 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
     # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    # llm = ChatGoogleGenerativeAI(
+    #     model=configurable.query_generator_model,
+    #     temperature=1.0,
+    #     max_retries=2,
+    #     api_key=os.getenv("GEMINI_API_KEY"),
+    # )
+    # structured_llm = llm.with_structured_output(SearchQueryList)
+
+    # # Format the prompt
+    # current_date = get_current_date()
+    # formatted_prompt = query_writer_instructions.format(
+    #     current_date=current_date,
+    #     research_topic=get_research_topic(state["messages"]),
+    #     number_queries=state["initial_search_query_count"],
+    # )
+    # # Generate the search queries
+    # result = structured_llm.invoke(formatted_prompt)
+    # return {"search_query": result.query}
 
     # Format the prompt
-    current_date = get_current_date()
     formatted_prompt = query_writer_instructions.format(
-        current_date=current_date,
+        current_date=get_current_date(),
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Generate the search queries
-    result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+    # Use the LLMClient to generate the search queries
+    raw = llm.query(
+        formatted_prompt,
+        model_name="qwen-turbo",
+        temperature=1.0,
+        deployment="ali",
+        system_message="你是一个结构化响应助手，请严格以 JSON 格式返回结果，不要多余内容。"
+    )
+
+    print("generate_query raw output:", raw)
+    import json
+    parsed = json.loads(raw)
+    # —— 兼容多种可能的返回格式 —— 
+    if isinstance(parsed, list):
+        # 如果直接就是字符串列表
+        queries = parsed
+    elif "queries" in parsed:
+        queries = parsed["queries"]
+    elif "query" in parsed:
+        # 可能单条时叫 query
+        queries = [parsed["query"]]
+    else:
+        # 回退：把整个文本按行拆分
+        queries = [line.strip() for line in raw.splitlines() if line.strip()]
+
+    return {"search_query": queries}
 
 
 def continue_to_web_research(state: QueryGenerationState):
@@ -112,22 +147,34 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     )
 
     # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
+    # response = genai_client.models.generate_content(
+    #     model=configurable.query_generator_model,
+    #     contents=formatted_prompt,
+    #     config={
+    #         "tools": [{"google_search": {}}],
+    #         "temperature": 0,
+    #     },
+    # )
+    # # resolve the urls to short urls for saving tokens and time
+    # resolved_urls = resolve_urls(
+    #     response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+    # )
+    # # Gets the citations and adds them to the generated text
+    # citations = get_citations(response, resolved_urls)
+    # modified_text = insert_citation_markers(response.text, citations)
+    # sources_gathered = [item for citation in citations for item in citation["segments"]]
+    # 使用 LLMClient 获取“假想”的搜索摘要
+    raw = llm.query(
+        formatted_prompt,
+        model_name="qwen-turbo",
+        temperature=0,
+        deployment="ali",
     )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    # 如果需要引用标记，可按原逻辑解析 raw 中的 citation 字段；此处简化为直接返回文本
+    modified_text = raw
+    # 这里我们不再维护 grounding 元数据
+    sources_gathered = []
+ 
 
     return {
         "sources_gathered": sources_gathered,
@@ -137,48 +184,54 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
-    """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
-
-    Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
-
-    Args:
-        state: Current graph state containing the running summary and research topic
-        config: Configuration for the runnable, including LLM provider settings
-
-    Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
-    """
     configurable = Configuration.from_runnable_config(config)
-    # Increment the research loop count and get the reasoning model
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
     reasoning_model = state.get("reasoning_model", configurable.reflection_model)
 
-    # Format the prompt
-    current_date = get_current_date()
     formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
+        current_date=get_current_date(),
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
+    # 调用 LLMClient
+    raw = llm.query(
+        formatted_prompt,
+        model_name="qwen-turbo",
+        temperature=1.0,
+        deployment="ali",
+        system_message="请严格以 JSON 格式返回 is_sufficient, knowledge_gap 和 follow_up_queries 字段"
+    )
+
+    # 去除 Markdown code fence，如果存在的话
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # 找到最后一个 ``` 并去掉 fences
+        parts = cleaned.split("```", 2)
+        if len(parts) == 3:
+            cleaned = parts[2].strip()
+
+    # 打印清洗后的内容，便于调试
+    print("reflection cleaned JSON:", cleaned)
+
+    # 尝试解析 JSON，失败时安全降级
+    import json
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print("JSONDecodeError:", e, "原始清洗后文本：", cleaned)
+        parsed = {}
+
+    is_sufficient     = parsed.get("is_sufficient", False)
+    knowledge_gap     = parsed.get("knowledge_gap", "")
+    follow_up_queries = parsed.get("follow_up_queries", [])
     return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
+        "is_sufficient": is_sufficient,
+        "knowledge_gap": knowledge_gap,
+        "follow_up_queries": follow_up_queries,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
-
 
 def evaluate_research(
     state: ReflectionState,
@@ -242,13 +295,22 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     )
 
     # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    # llm = ChatGoogleGenerativeAI(
+    #     model=reasoning_model,
+    #     temperature=0,
+    #     max_retries=2,
+    #     api_key=os.getenv("GEMINI_API_KEY"),
+    # )
+    # result = llm.invoke(formatted_prompt)
+    raw = llm.query(
+        formatted_prompt,
+        model_name="qwen-turbo",
         temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
+        deployment="ali",
     )
-    result = llm.invoke(formatted_prompt)
+    class Dummy: pass
+    result = Dummy()
+    result.content = raw
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
